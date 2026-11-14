@@ -3475,22 +3475,90 @@ def request_changes(
     return True, implementer
 
 
+# A triage card that already carries scope may skip the specifier. ``specify``
+# is an auxiliary-LLM rewrite: it is the right exit from triage for a one-line
+# idea, and the wrong one for a card whose measured body came from a receptor, a
+# PR event or the block-loop breaker — the rewrite is what would lose it. These
+# anchors are the "already has scope" test: something concrete to act on.
+_SCOPE_ANCHOR_RES = (
+    re.compile(r"https?://\S+"),                                   # a URL (PR, issue, doc)
+    re.compile(r"(?:^|[^\w#])#\d+\b"),                             # a PR/issue number
+    re.compile(r"`[^`\n]+`"),                                      # a command, path or token
+    re.compile(r"(?:^|\s)/(?:[\w.@+-]+/)+[\w.@+-]+"),              # an absolute path
+    re.compile(r"\bPLAN-[A-Z0-9]+-\d{4}-\d{2}-\d{2}-[A-Z0-9-]+"),  # a plan id
+)
+
+# Below this, the body is not a spec an LLM pass would merely restate — it is a
+# one-liner, and the specifier is the honest next step.
+_MIN_SCOPE_CHARS = 200
+
+
+def triage_scope_anchor(title: str, body: str) -> Optional[str]:
+    """The concrete anchor that lets a ``triage`` card skip the specifier, or ``None``.
+
+    A gate, never a rewrite: the card is not touched. ``None`` means "this card
+    still needs ``specify``" — either the body is too thin to be a spec, or it
+    names nothing concrete (no URL, PR/issue number, command, path or Plan-ID).
+    """
+    text = f"{title or ''}\n{body or ''}"
+    if len(text.strip()) < _MIN_SCOPE_CHARS:
+        return None
+    for pattern in _SCOPE_ANCHOR_RES:
+        found = pattern.search(text)
+        if found:
+            return found.group(0).strip()
+    return None
+
+
 def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
-    dry_run: bool = False,
+    dry_run: bool = False, from_triage: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
-    Refused while a parent is unfinished; ``dry_run`` only validates.
-    Returns ``(ok, reason)``."""
+
+    ``from_triage=True`` also accepts a ``triage`` card, but only one that
+    already carries scope (:func:`triage_scope_anchor`). That is the official
+    exit from triage for a PR card the receptor or the block-loop breaker
+    parked there: no auxiliary LLM runs, nothing is rewritten, and the
+    ``promoted_manual`` event — with its ``reason`` — is the same rework marker
+    the dispatcher reads to lift ``active_pr``. A card without scope is refused
+    and pointed at ``specify``. Refused while a parent is unfinished;
+    ``dry_run`` only validates. Returns ``(ok, reason)``.
+    """
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
 
-    if cur_status not in ("todo", "blocked"):
+    if cur_status == "triage" and not from_triage:
+        return False, (
+            f"task {task_id} is 'triage'; promote only applies to 'todo' or "
+            f"'blocked'. A card that already carries scope can be released with "
+            f"`hermes kanban promote {task_id} --from-triage`; anything else "
+            f"needs `hermes kanban specify {task_id}`."
+        )
+
+    if cur_status not in ("todo", "blocked", "triage"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
             f"'todo' or 'blocked'"
         )
+
+    scope: Optional[str] = None
+    if cur_status == "triage":
+        row = conn.execute(
+            "SELECT title, body FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        title = _lossy_text(row[0]) or ""
+        body = _lossy_text(row[1]) or ""
+        scope = triage_scope_anchor(title, body)
+        if scope is None:
+            return False, (
+                f"task {task_id} is in triage without scope: no URL, PR/issue "
+                f"number, command, path or Plan-ID in a body of at least "
+                f"{_MIN_SCOPE_CHARS} chars. Expand it with "
+                f"`hermes kanban specify {task_id}`, or put the scope on the "
+                f"card first."
+            )
 
     # No override: claim_task demotes ready -> todo on an undone parent whichever
     # writer set 'ready', so a forced promotion would only report a success the
@@ -3512,14 +3580,22 @@ def promote_task(
     if dry_run:
         return True, None
 
+    # The status set is the compare-and-swap: a triage release may only come
+    # from triage, so a concurrent specify/compose cannot be overwritten.
+    allowed = ("triage",) if cur_status == "triage" else ("todo", "blocked")
+    placeholders = ", ".join("?" for _ in allowed)
     with write_txn(conn):
         upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
+            f"UPDATE tasks SET status = 'ready' WHERE id = ? AND status IN ({placeholders})",
+            (task_id, *allowed),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
-        _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
+        payload: dict[str, Any] = {"actor": actor, "reason": reason}
+        if scope is not None:
+            payload["from"] = "triage"
+            payload["scope"] = scope
+        _append_event(conn, task_id, "promoted_manual", payload)
 
     return True, None
 
