@@ -1094,13 +1094,15 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     # Dedupe while preserving order; positional task_id always first.
     ids = list(dict.fromkeys(_bulk_ids(args)))
     dry_run = bool(args.dry_run)
+    from_triage = bool(getattr(args, "from_triage", False))
 
     results: list[dict[str, object]] = []
     with kbc.connect_closing() as conn:
         for tid in ids:
-            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, dry_run=dry_run)
+            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason,
+                                      dry_run=dry_run, from_triage=from_triage)
             results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run,
-                            "reason": reason, "error": err})
+                            "from_triage": from_triage, "reason": reason, "error": err})
 
     failed = [r for r in results if not r["promoted"]]
     if getattr(args, "json", False):

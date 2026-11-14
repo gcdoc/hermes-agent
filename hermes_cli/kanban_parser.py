@@ -351,6 +351,10 @@ _SPECS = [
         _TASK_ID,
         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),
         _bulk_ids("promote"),
+        _arg("--from-triage", dest="from_triage", action="store_true",
+             help="Also release a triage card that already carries scope (a URL, "
+                  "PR/issue number, command, path or Plan-ID in a real body) — no "
+                  "auxiliary-LLM rewrite. Without it triage is refused."),
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
